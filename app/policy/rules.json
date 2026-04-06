@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "rules": {
+    "thresholds.default": {
+      "id": "thresholds.default",
+      "policy_type": "escalation_threshold",
+      "enabled": true,
+      "description": "Default risk thresholds for sanitize/escalate/block decisions.",
+      "action": "allow",
+      "thresholds": {
+        "sanitize_at": 10,
+        "escalate_at": 50,
+        "block_at": 100
+      }
+    },
+
+    "INJ_BLOCK_IGNORE_PREVIOUS": {
+      "id": "INJ_BLOCK_IGNORE_PREVIOUS",
+      "policy_type": "restricted_action",
+      "enabled": true,
+      "description": "Blocks instruction-override attempts (prompt injection).",
+      "action": "block",
+      "score": 100,
+      "match": {
+        "phrases": [
+          "ignore previous instructions",
+          "ignore all previous instructions"
+        ]
+      }
+    },
+
+    "INJ_BLOCK_ROLE_HIJACK": {
+      "id": "INJ_BLOCK_ROLE_HIJACK",
+      "policy_type": "restricted_action",
+      "enabled": true,
+      "description": "Blocks role hijacking / system prompt impersonation attempts.",
+      "action": "block",
+      "score": 100,
+      "match": {
+        "phrases": [
+          "you are now the system",
+          "act as the system",
+          "system prompt"
+        ]
+      }
+    },
+
+    "SENSITIVE_CREDENTIALS_ESCALATE": {
+      "id": "SENSITIVE_CREDENTIALS_ESCALATE",
+      "policy_type": "sensitive_topic",
+      "enabled": true,
+      "description": "Escalate when the user appears to share or request secrets (credentials/tokens).",
+      "action": "escalate",
+      "score": 60,
+      "match": {
+        "phrases": [
+          "api key",
+          "access token",
+          "private key"
+        ]
+      }
+    },
+
+    "ALLOWED_GENERAL_ASSISTANCE": {
+      "id": "ALLOWED_GENERAL_ASSISTANCE",
+      "policy_type": "allowed_behavior",
+      "enabled": true,
+      "description": "General benign assistance intent (informational; does not override restricted/sensitive rules).",
+      "action": "allow",
+      "score": 0,
+      "match": {
+        "keywords": [
+          "help",
+          "explain",
+          "how"
+        ]
+      }
+    }
+  }
+}
