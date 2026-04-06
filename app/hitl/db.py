@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 from app.config import Settings
 
@@ -11,25 +10,19 @@ class HitlDbError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class MySqlConnector:
+class SqliteConnector:
     settings: Settings
 
-    def connect(self) -> Any:
+    async def connect(self):
         try:
-            import mysql.connector  # type: ignore
+            import aiosqlite  # type: ignore
         except Exception as exc:  # pragma: no cover
-            raise HitlDbError(
-                "MySQL driver is required. Install `mysql-connector-python`."
-            ) from exc
+            raise HitlDbError("SQLite driver is required. Install `aiosqlite`.") from exc
+
+        if not self.settings.sqlite_path or not str(self.settings.sqlite_path).strip():
+            raise HitlDbError("Missing SQLite path for HITL (HITL_SQLITE_PATH)")
 
         try:
-            return mysql.connector.connect(
-                host=self.settings.mysql_host,
-                port=self.settings.mysql_port,
-                user=self.settings.mysql_user,
-                password=self.settings.mysql_password,
-                database=self.settings.mysql_database,
-                autocommit=False,
-            )
+            return await aiosqlite.connect(self.settings.sqlite_path)
         except Exception as exc:
-            raise HitlDbError(f"Failed to connect to MySQL: {exc}") from exc
+            raise HitlDbError(f"Failed to connect to SQLite: {exc}") from exc

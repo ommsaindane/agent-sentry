@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import anyio
+
 from app.agent.agent import DecisionAgent
 from app.guards.input_guard import InputGuard
 from app.guards.output_guard import OutputGuard
@@ -17,13 +19,14 @@ class PipelineError(RuntimeError):
 
 
 class HitlServiceLike(Protocol):
-    def enqueue(
+    async def enqueue(
         self,
         *,
         request_id: str,
         decision: str,
         input_raw: str,
         input_sanitized: str,
+        risk_score: float,
         guard_obj: dict[str, Any],
         policy_obj: dict[str, Any],
         agent_obj: dict[str, Any],
@@ -39,6 +42,7 @@ class ChatPipelineDeps:
     output_guard: OutputGuard
     hitl_service: HitlServiceLike | None
     enable_hitl: bool
+    risk_threshold: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +52,7 @@ class ChatPipelineResult:
     queue_id: int | None
 
 
-def run_chat_pipeline(
+async def run_chat_pipeline(
     *,
     request_id: str,
     message: str,
@@ -70,7 +74,7 @@ def run_chat_pipeline(
         max_output_tokens=max_output_tokens,
     )
 
-    policy_result = deps.policy_engine.evaluate(message)
+    policy_result = await anyio.to_thread.run_sync(lambda: deps.policy_engine.evaluate(message))
     trace.event(
         "chat.policy.evaluated",
         request_id=request_id,
@@ -79,20 +83,23 @@ def run_chat_pipeline(
         matched_rule_ids=list(policy_result.matched_rule_ids),
     )
 
-    guard_result = deps.input_guard.evaluate(message)
+    guard_result = await anyio.to_thread.run_sync(lambda: deps.input_guard.evaluate(message))
+    guard_risk_score = float(guard_result.classification.risk_score)
     trace.event(
         "chat.input_guard.done",
         request_id=request_id,
         guard_decision=guard_result.decision,
         guard_attack_type=guard_result.classification.attack_type.value,
-        guard_risk_score=float(guard_result.classification.risk_score),
+        guard_risk_score=guard_risk_score,
         input_sanitized=guard_result.final_text,
         matched_rule_ids=list(guard_result.matched_rule_ids),
     )
 
-    agent_out = deps.decision_agent.decide(
-        guard_result=guard_result,
-        policy_result=policy_result,
+    agent_out = await anyio.to_thread.run_sync(
+        lambda: deps.decision_agent.decide(
+            guard_result=guard_result,
+            policy_result=policy_result,
+        )
     )
     trace.event(
         "chat.agent.decided",
@@ -102,11 +109,22 @@ def run_chat_pipeline(
         reason=str(agent_out.reason),
     )
 
-    if agent_out.decision == "block":
+    # HITL trigger: either agent requests escalation OR guard risk exceeds threshold.
+    effective_decision = agent_out.decision
+    if effective_decision not in {"block", "escalate"} and guard_risk_score > float(deps.risk_threshold):
+        effective_decision = "escalate"
+        trace.event(
+            "chat.agent.overridden_by_risk_threshold",
+            request_id=request_id,
+            threshold=float(deps.risk_threshold),
+            guard_risk_score=guard_risk_score,
+        )
+
+    if effective_decision == "block":
         trace.event("chat.terminated.blocked", request_id=request_id)
         return ChatPipelineResult(decision="block", output_text="", queue_id=None)
 
-    if agent_out.decision == "escalate":
+    if effective_decision == "escalate":
         if not deps.enable_hitl or deps.hitl_service is None:
             raise PipelineError("HITL is disabled or not configured, but escalation was required")
 
@@ -114,11 +132,12 @@ def run_chat_pipeline(
         policy_obj = policy_result.to_dict()
         agent_obj = agent_out.model_dump()
 
-        enqueue_result = deps.hitl_service.enqueue(
+        enqueue_result = await deps.hitl_service.enqueue(
             request_id=request_id,
             decision="escalate",
             input_raw=message,
             input_sanitized=guard_result.final_text,
+            risk_score=guard_risk_score,
             guard_obj=guard_obj,
             policy_obj=policy_obj,
             agent_obj=agent_obj,
@@ -143,7 +162,7 @@ def run_chat_pipeline(
         system_prompt=None,
     )
 
-    llm_resp = deps.llm_proxy.generate(llm_req)
+    llm_resp = await anyio.to_thread.run_sync(lambda: deps.llm_proxy.generate(llm_req))
     trace.event(
         "chat.llm.generated",
         request_id=request_id,
@@ -152,7 +171,7 @@ def run_chat_pipeline(
         usage=llm_resp.usage,
     )
 
-    out_guard = deps.output_guard.evaluate(llm_resp.raw_text)
+    out_guard = await anyio.to_thread.run_sync(lambda: deps.output_guard.evaluate(llm_resp.raw_text))
     trace.event(
         "chat.output_guard.done",
         request_id=request_id,
@@ -169,4 +188,4 @@ def run_chat_pipeline(
         return ChatPipelineResult(decision="block", output_text=out_guard.final_output, queue_id=None)
 
     trace.event("chat.completed", request_id=request_id)
-    return ChatPipelineResult(decision=str(agent_out.decision), output_text=out_guard.final_output, queue_id=None)
+    return ChatPipelineResult(decision=str(effective_decision), output_text=out_guard.final_output, queue_id=None)

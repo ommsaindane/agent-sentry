@@ -43,6 +43,18 @@ def _get_env_bool(name: str, *, default: bool | None = None) -> bool:
     raise SettingsError(f"Env var {name} must be a boolean (true/false)")
 
 
+def _get_env_float(name: str, *, default: float | None = None) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        if default is None:
+            raise SettingsError(f"Missing required env var: {name}")
+        return float(default)
+    try:
+        return float(str(raw).strip())
+    except Exception as exc:
+        raise SettingsError(f"Env var {name} must be a float") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     # LLM settings
@@ -51,12 +63,9 @@ class Settings:
 
     # HITL settings
     enable_hitl: bool
-    mysql_host: str
-    mysql_port: int
-    mysql_user: str
-    mysql_password: str
-    mysql_database: str
-    mysql_table: str
+    risk_threshold: float
+    sqlite_path: str
+    sqlite_table: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -68,29 +77,24 @@ class Settings:
 
         # HITL is optional, but if enabled it must be fully configured.
         if enable_hitl:
-            mysql_host = _require_env("MYSQL_HOST")
-            mysql_port = _get_env_int("MYSQL_PORT", default=3306)
-            mysql_user = _require_env("MYSQL_USER")
-            mysql_password = _require_env("MYSQL_PASSWORD")
-            mysql_database = _require_env("MYSQL_DATABASE")
+            sqlite_path = _require_env("HITL_SQLITE_PATH")
+            risk_threshold = _get_env_float("RISK_THRESHOLD")
+            if risk_threshold < 0.0 or risk_threshold > 1.0:
+                raise SettingsError("RISK_THRESHOLD must be in [0,1]")
         else:
-            mysql_host = ""
-            mysql_port = _get_env_int("MYSQL_PORT", default=3306)
-            mysql_user = ""
-            mysql_password = ""
-            mysql_database = ""
-        mysql_table = os.getenv("MYSQL_HITL_TABLE")
-        if mysql_table is None or not str(mysql_table).strip():
-            mysql_table = "hitl_queue"
+            sqlite_path = os.getenv("HITL_SQLITE_PATH") or ""
+            # Risk threshold unused when HITL disabled; keep deterministic value.
+            risk_threshold = _get_env_float("RISK_THRESHOLD", default=1.0)
+
+        sqlite_table = os.getenv("HITL_SQLITE_TABLE")
+        if sqlite_table is None or not str(sqlite_table).strip():
+            sqlite_table = "hitl_queue"
 
         return cls(
             openai_api_key=openai_api_key,
             openai_model=openai_model,
             enable_hitl=enable_hitl,
-            mysql_host=mysql_host,
-            mysql_port=mysql_port,
-            mysql_user=mysql_user,
-            mysql_password=mysql_password,
-            mysql_database=mysql_database,
-            mysql_table=str(mysql_table),
+            risk_threshold=float(risk_threshold),
+            sqlite_path=str(sqlite_path),
+            sqlite_table=str(sqlite_table),
         )

@@ -58,7 +58,6 @@ def create_app() -> FastAPI:
     hitl_service = None
     if settings.enable_hitl:
         hitl_service = HitlService.from_settings(settings)
-        hitl_service.ensure_schema()
 
     deps = ChatPipelineDeps(
         policy_engine=policy_engine,
@@ -68,10 +67,17 @@ def create_app() -> FastAPI:
         output_guard=output_guard,
         hitl_service=hitl_service,
         enable_hitl=settings.enable_hitl,
+        risk_threshold=settings.risk_threshold,
     )
 
     app = FastAPI(title="AgentSentry", version="0.1.0")
     app.state.state = AppState(deps=deps, trace=trace)
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        state: AppState = app.state.state
+        if state.deps.enable_hitl and state.deps.hitl_service is not None:
+            await state.deps.hitl_service.ensure_schema()
 
     @app.post(
         "/chat",
@@ -81,12 +87,12 @@ def create_app() -> FastAPI:
             403: {"model": ChatBlockedResponse},
         },
     )
-    def chat(req: ChatRequest):
+    async def chat(req: ChatRequest):
         request_id = uuid4().hex
         state: AppState = app.state.state
 
         try:
-            result = run_chat_pipeline(
+            result = await run_chat_pipeline(
                 request_id=request_id,
                 message=req.message,
                 max_output_tokens=req.max_output_tokens,
