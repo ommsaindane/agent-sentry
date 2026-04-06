@@ -7,8 +7,11 @@ import anyio
 
 from app.agent.agent import DecisionAgent
 from app.guards.input_guard import InputGuard
+from app.guards.input_guard import InputGuardError
 from app.guards.output_guard import OutputGuard
+from app.guards.output_guard import OutputGuardError
 from app.llm.llm_client import OpenAIProxyClient
+from app.llm.llm_client import LlmProxyError
 from app.logging.logger import TraceLogger, mask_terms_case_insensitive
 from app.policy.policy_engine import PolicyEngine
 from app.schemas.llm import LlmProxyRequest
@@ -86,7 +89,12 @@ async def run_chat_pipeline(
         matched_rule_ids=list(policy_result.matched_rule_ids),
     )
 
-    guard_result = await anyio.to_thread.run_sync(lambda: deps.input_guard.evaluate(message))
+    try:
+        guard_result = await anyio.to_thread.run_sync(lambda: deps.input_guard.evaluate(message))
+    except InputGuardError as exc:
+        raise PipelineError(str(exc)) from exc
+    except Exception as exc:
+        raise PipelineError(f"Input guard failed: {exc}") from exc
     guard_risk_score = float(guard_result.classification.risk_score)
     masked_input_sanitized = mask_terms_case_insensitive(guard_result.final_text, redact_terms_input)
     trace.event(
@@ -100,12 +108,15 @@ async def run_chat_pipeline(
         matched_rule_ids=list(guard_result.matched_rule_ids),
     )
 
-    agent_out = await anyio.to_thread.run_sync(
-        lambda: deps.decision_agent.decide(
-            guard_result=guard_result,
-            policy_result=policy_result,
+    try:
+        agent_out = await anyio.to_thread.run_sync(
+            lambda: deps.decision_agent.decide(
+                guard_result=guard_result,
+                policy_result=policy_result,
+            )
         )
-    )
+    except Exception as exc:
+        raise PipelineError(f"Decision agent failed: {exc}") from exc
     trace.event(
         "chat.agent.decided",
         request_id=request_id,
@@ -167,7 +178,12 @@ async def run_chat_pipeline(
         system_prompt=None,
     )
 
-    llm_resp = await anyio.to_thread.run_sync(lambda: deps.llm_proxy.generate(llm_req))
+    try:
+        llm_resp = await anyio.to_thread.run_sync(lambda: deps.llm_proxy.generate(llm_req))
+    except LlmProxyError as exc:
+        raise PipelineError(str(exc)) from exc
+    except Exception as exc:
+        raise PipelineError(f"LLM proxy failed: {exc}") from exc
 
     # Mask logged outputs using policy sensitive-topic matches on the output itself.
     llm_policy_for_log = await anyio.to_thread.run_sync(lambda: deps.policy_engine.evaluate(llm_resp.raw_text))
@@ -183,7 +199,12 @@ async def run_chat_pipeline(
         usage=llm_resp.usage,
     )
 
-    out_guard = await anyio.to_thread.run_sync(lambda: deps.output_guard.evaluate(llm_resp.raw_text))
+    try:
+        out_guard = await anyio.to_thread.run_sync(lambda: deps.output_guard.evaluate(llm_resp.raw_text))
+    except OutputGuardError as exc:
+        raise PipelineError(str(exc)) from exc
+    except Exception as exc:
+        raise PipelineError(f"Output guard failed: {exc}") from exc
     masked_final_output = mask_terms_case_insensitive(out_guard.final_output, redact_terms_output)
     trace.event(
         "chat.output_guard.done",

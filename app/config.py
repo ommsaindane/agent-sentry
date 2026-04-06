@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 
 class SettingsError(RuntimeError):
@@ -78,6 +79,7 @@ class Settings:
         # HITL is optional, but if enabled it must be fully configured.
         if enable_hitl:
             sqlite_path = _require_env("HITL_SQLITE_PATH")
+            _validate_hitl_sqlite_path(sqlite_path)
             risk_threshold = _get_env_float("RISK_THRESHOLD")
             if risk_threshold < 0.0 or risk_threshold > 1.0:
                 raise SettingsError("RISK_THRESHOLD must be in [0,1]")
@@ -97,4 +99,34 @@ class Settings:
             risk_threshold=float(risk_threshold),
             sqlite_path=str(sqlite_path),
             sqlite_table=str(sqlite_table),
+        )
+
+
+def _validate_hitl_sqlite_path(sqlite_path: str) -> None:
+    """Require HITL SQLite files to live in a dedicated folder (not repo root).
+
+    This avoids creating `hitl*.db` in the project root by accident.
+    """
+
+    p = str(sqlite_path or "").strip()
+    if not p:
+        raise SettingsError("HITL_SQLITE_PATH is required")
+
+    # Allow in-memory databases explicitly.
+    if p == ":memory:":
+        return
+
+    path = Path(p)
+
+    # Absolute paths are allowed (caller controls location).
+    if path.is_absolute():
+        return
+
+    # For relative paths, enforce a directory component.
+    # Examples that should FAIL: "hitl.db", "./hitl.db"
+    # Examples that should PASS: "data/hitl.db", "./data/hitl.db"
+    if path.parent == Path("."):
+        raise SettingsError(
+            "HITL_SQLITE_PATH must include a directory (not project root). "
+            "Example: ./data/hitl.db"
         )

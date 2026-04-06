@@ -11,6 +11,10 @@ wheels/
 
 .env
 
+# Local runtime data
+data/
+*.db
+
 .github/
 
 tests/

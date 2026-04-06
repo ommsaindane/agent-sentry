@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -56,41 +55,24 @@ class OpenAIClient(LlmClient):
 
         client = OpenAI(api_key=self.api_key)
 
-        # Pydantic v2 schema. The OpenAI API expects a JSON Schema object.
-        json_schema = schema_model.model_json_schema()
-
         try:
-            response = client.responses.create(
+            response = client.responses.parse(
                 model=self.model,
                 temperature=0,
                 input=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema_model.__name__,
-                        "schema": json_schema,
-                        "strict": True,
-                    },
-                },
+                text_format=schema_model,
             )
         except Exception as exc:
             raise LlmClientError(f"OpenAI request failed: {exc}") from exc
 
-        # The OpenAI SDK returns structured output text; enforce strict JSON parse.
-        try:
-            output_text = response.output_text
-        except Exception as exc:
-            raise LlmClientError("OpenAI response missing output_text") from exc
+        parsed = getattr(response, "output_parsed", None)
+        if parsed is None:
+            raise LlmClientError("OpenAI response missing parsed structured output")
 
-        try:
-            parsed = json.loads(output_text)
-        except json.JSONDecodeError as exc:
-            raise LlmClientError(f"Model did not return valid JSON: {exc}") from exc
+        if not isinstance(parsed, BaseModel):
+            raise LlmClientError("OpenAI parsed output did not match expected schema")
 
-        if not isinstance(parsed, dict):
-            raise LlmClientError("Model JSON output must be an object")
-
-        return parsed
+        return parsed.model_dump()
