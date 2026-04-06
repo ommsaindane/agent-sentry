@@ -9,7 +9,7 @@ from app.agent.agent import DecisionAgent
 from app.guards.input_guard import InputGuard
 from app.guards.output_guard import OutputGuard
 from app.llm.llm_client import OpenAIProxyClient
-from app.logging.logger import TraceLogger
+from app.logging.logger import TraceLogger, mask_terms_case_insensitive
 from app.policy.policy_engine import PolicyEngine
 from app.schemas.llm import LlmProxyRequest
 
@@ -67,14 +67,17 @@ async def run_chat_pipeline(
     if not isinstance(max_output_tokens, int) or max_output_tokens <= 0:
         raise PipelineError("max_output_tokens must be a positive integer")
 
+    policy_result = await anyio.to_thread.run_sync(lambda: deps.policy_engine.evaluate(message))
+
+    redact_terms_input = [m.matched for m in policy_result.matches if m.policy_type == "sensitive_topic"]
+    masked_input_raw = mask_terms_case_insensitive(message, redact_terms_input)
+
     trace.event(
         "chat.request.received",
         request_id=request_id,
-        input_raw=message,
+        input_raw=masked_input_raw,
         max_output_tokens=max_output_tokens,
     )
-
-    policy_result = await anyio.to_thread.run_sync(lambda: deps.policy_engine.evaluate(message))
     trace.event(
         "chat.policy.evaluated",
         request_id=request_id,
@@ -85,13 +88,15 @@ async def run_chat_pipeline(
 
     guard_result = await anyio.to_thread.run_sync(lambda: deps.input_guard.evaluate(message))
     guard_risk_score = float(guard_result.classification.risk_score)
+    masked_input_sanitized = mask_terms_case_insensitive(guard_result.final_text, redact_terms_input)
     trace.event(
         "chat.input_guard.done",
         request_id=request_id,
         guard_decision=guard_result.decision,
+        is_malicious=bool(guard_result.classification.is_malicious),
         guard_attack_type=guard_result.classification.attack_type.value,
         guard_risk_score=guard_risk_score,
-        input_sanitized=guard_result.final_text,
+        input_sanitized=masked_input_sanitized,
         matched_rule_ids=list(guard_result.matched_rule_ids),
     )
 
@@ -163,21 +168,29 @@ async def run_chat_pipeline(
     )
 
     llm_resp = await anyio.to_thread.run_sync(lambda: deps.llm_proxy.generate(llm_req))
+
+    # Mask logged outputs using policy sensitive-topic matches on the output itself.
+    llm_policy_for_log = await anyio.to_thread.run_sync(lambda: deps.policy_engine.evaluate(llm_resp.raw_text))
+    redact_terms_output = [m.matched for m in llm_policy_for_log.matches if m.policy_type == "sensitive_topic"]
+    redact_terms_output = list(dict.fromkeys(redact_terms_input + redact_terms_output))
+    masked_llm_output = mask_terms_case_insensitive(llm_resp.raw_text, redact_terms_output)
+
     trace.event(
         "chat.llm.generated",
         request_id=request_id,
         llm_model=llm_resp.model,
-        output_raw=llm_resp.raw_text,
+        output_raw=masked_llm_output,
         usage=llm_resp.usage,
     )
 
     out_guard = await anyio.to_thread.run_sync(lambda: deps.output_guard.evaluate(llm_resp.raw_text))
+    masked_final_output = mask_terms_case_insensitive(out_guard.final_output, redact_terms_output)
     trace.event(
         "chat.output_guard.done",
         request_id=request_id,
         is_safe=bool(out_guard.is_safe),
         violations=list(out_guard.violations),
-        output_final=out_guard.final_output,
+        output_final=masked_final_output,
         output_policy_decision=out_guard.policy_decision,
         output_policy_risk_score=int(out_guard.policy_risk_score),
         matched_rule_ids=list(out_guard.matched_rule_ids),
