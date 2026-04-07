@@ -31,16 +31,16 @@ class PolicyMatch:
 
 @dataclass(frozen=True, slots=True)
 class PolicyResult:
-    decision: Decision
     risk_score: int
     matched_rule_ids: tuple[str, ...]
     matches: tuple[PolicyMatch, ...]
+    thresholds: dict[str, int]
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "decision": self.decision,
             "risk_score": self.risk_score,
             "matched_rule_ids": list(self.matched_rule_ids),
+            "thresholds": dict(self.thresholds),
             "matches": [
                 {
                     "rule_id": m.rule_id,
@@ -72,14 +72,6 @@ class _Rule:
     keywords: tuple[str, ...]
     phrases: tuple[tuple[str, ...], ...]
     thresholds: _Thresholds | None
-
-
-_ACTION_PRECEDENCE: dict[Decision, int] = {
-    "allow": 0,
-    "sanitize": 1,
-    "escalate": 2,
-    "block": 3,
-}
 
 
 class PolicyEngine:
@@ -129,20 +121,18 @@ class PolicyEngine:
                     )
                 )
 
-        threshold_decision = self._decision_from_thresholds(risk_score)
-        decision = threshold_decision
-        for m in matches:
-            if _ACTION_PRECEDENCE[m.action] > _ACTION_PRECEDENCE[decision]:
-                decision = m.action
-
         matched_rule_ids = tuple(sorted({m.rule_id for m in matches}))
         matches_sorted = tuple(sorted(matches, key=lambda m: (m.rule_id, m.matched)))
 
         return PolicyResult(
-            decision=decision,
             risk_score=risk_score,
             matched_rule_ids=matched_rule_ids,
             matches=matches_sorted,
+            thresholds={
+                "sanitize_at": int(self._thresholds.sanitize_at),
+                "escalate_at": int(self._thresholds.escalate_at),
+                "block_at": int(self._thresholds.block_at),
+            },
         )
 
     def _load_json(self, path: Path) -> dict[str, Any]:
@@ -310,15 +300,6 @@ class PolicyEngine:
             phrases=phrases,
             thresholds=thresholds,
         )
-
-    def _decision_from_thresholds(self, risk_score: int) -> Decision:
-        if risk_score >= self._thresholds.block_at:
-            return "block"
-        if risk_score >= self._thresholds.escalate_at:
-            return "escalate"
-        if risk_score >= self._thresholds.sanitize_at:
-            return "sanitize"
-        return "allow"
 
     def _normalize_text(self, text: str) -> str:
         normalized = unicodedata.normalize("NFKC", text).casefold()

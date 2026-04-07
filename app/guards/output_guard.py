@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from app.guards.prompts import OUTPUT_GUARD_SYSTEM_PROMPT, build_output_guard_user_prompt
 from app.llm.client import LlmClient, LlmClientError
 from app.policy.policy_engine import PolicyEngine, PolicyResult
+from app.policy.decision import policy_decision_from_signals
 from app.schemas.output_guard import OutputGuardClassification
 
 
@@ -25,6 +26,10 @@ class OutputGuardResult:
     policy_risk_score: int
     matched_rule_ids: list[str]
 
+    # Internal-only helper for deterministic log masking in the pipeline.
+    # NOTE: Do not log these raw terms.
+    redact_terms: list[str]
+
 
 @dataclass(frozen=True, slots=True)
 class OutputGuard:
@@ -35,23 +40,10 @@ class OutputGuard:
         if not isinstance(raw_output_text, str):
             raise OutputGuardError("raw_output_text must be a string")
 
-        policy_result = self.policy_engine.evaluate(raw_output_text)
-
-        # Deterministic backstop: hard block if policy blocks.
-        if policy_result.decision == "block":
-            return OutputGuardResult(
-                is_safe=False,
-                violations=self._stable_violations(["policy_violation"] + list(policy_result.matched_rule_ids)),
-                final_output=SAFE_REPLACEMENT_MESSAGE,
-                policy_decision=policy_result.decision,
-                policy_risk_score=policy_result.risk_score,
-                matched_rule_ids=list(policy_result.matched_rule_ids),
-            )
-
-        policy_context = self._build_policy_context(policy_result)
+        # One-pass flow: classify first, then enforce policy once on the classifier output.
         user_prompt = build_output_guard_user_prompt(
             raw_llm_output=raw_output_text,
-            policy_context=policy_context,
+            policy_context="policy_context: (not evaluated prior to classification)",
         )
 
         try:
@@ -70,66 +62,54 @@ class OutputGuard:
 
         violations = self._stable_violations(classification.violations)
 
+        # Enforce policy once, after classification, using the classifier's output.
+        policy_result = self.policy_engine.evaluate(classification.final_output)
+        policy_decision = policy_decision_from_signals(policy_result)
+        matched_rule_ids = list(policy_result.matched_rule_ids)
+
         # Deterministic masking: if policy indicates sensitive-topic matches OR classifier flags pii.
         sensitive_terms = self._sensitive_terms_from_policy(policy_result)
+        redact_terms = list(sensitive_terms)
         should_mask = ("pii_leakage" in set(violations)) or bool(sensitive_terms)
 
         final_output = classification.final_output
         if should_mask:
             final_output = self._mask_terms_case_insensitive(final_output, sensitive_terms)
 
-        # If unsafe, replace/block deterministically.
+        # Classifier safety takes precedence.
         if not classification.is_safe:
             return OutputGuardResult(
                 is_safe=False,
                 violations=violations if violations else ["unsafe_or_disallowed_content"],
                 final_output=SAFE_REPLACEMENT_MESSAGE,
-                policy_decision=policy_result.decision,
+                policy_decision=str(policy_decision),
                 policy_risk_score=policy_result.risk_score,
-                matched_rule_ids=list(policy_result.matched_rule_ids),
+                matched_rule_ids=matched_rule_ids,
+                redact_terms=redact_terms,
             )
 
-        # If only PII leakage and we masked, treat as safe output but keep violations for traceability.
-        if set(violations) == {"pii_leakage"} and should_mask:
-            is_safe = True
-        else:
-            is_safe = True
-
-        # Final deterministic policy backstop on output.
-        final_policy = self.policy_engine.evaluate(final_output)
-        if final_policy.decision == "block":
+        # Policy enforcement (single pass).
+        if policy_decision == "block":
             return OutputGuardResult(
                 is_safe=False,
-                violations=self._stable_violations(violations + ["policy_violation"] + list(final_policy.matched_rule_ids)),
+                violations=self._stable_violations(violations + ["policy_violation"] + matched_rule_ids),
                 final_output=SAFE_REPLACEMENT_MESSAGE,
-                policy_decision=final_policy.decision,
-                policy_risk_score=final_policy.risk_score,
-                matched_rule_ids=list(final_policy.matched_rule_ids),
+                policy_decision=str(policy_decision),
+                policy_risk_score=policy_result.risk_score,
+                matched_rule_ids=matched_rule_ids,
+                redact_terms=redact_terms,
             )
 
+        # If we only flagged PII leakage, masking makes the output safe enough to return.
         return OutputGuardResult(
-            is_safe=is_safe,
+            is_safe=True,
             violations=violations,
             final_output=final_output,
-            policy_decision=policy_result.decision,
+            policy_decision=str(policy_decision),
             policy_risk_score=policy_result.risk_score,
-            matched_rule_ids=list(policy_result.matched_rule_ids),
+            matched_rule_ids=matched_rule_ids,
+            redact_terms=redact_terms,
         )
-
-    def _build_policy_context(self, policy_result: PolicyResult) -> str:
-        lines: list[str] = []
-        lines.append(f"policy_decision: {policy_result.decision}")
-        lines.append(f"policy_risk_score: {policy_result.risk_score}")
-        if policy_result.matched_rule_ids:
-            lines.append("matched_rules:")
-            for rid in policy_result.matched_rule_ids:
-                rule = self.policy_engine.get_rule(rid)
-                desc = str(rule.get("description", "")).strip()
-                action = str(rule.get("action", "")).strip()
-                lines.append(f"- {rid}: action={action}; description={desc}")
-        else:
-            lines.append("matched_rules: none")
-        return "\n".join(lines)
 
     def _stable_violations(self, violations: list[str]) -> list[str]:
         # Deterministic ordering and de-dupe, ignoring falsy entries.

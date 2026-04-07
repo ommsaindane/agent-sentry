@@ -8,8 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
-from app.agent.agent import DecisionAgent
-from app.agent.tools import DecisionTools
+from app.agent.agent import ResolverAgent
 from app.config import Settings, SettingsError
 from app.core.pipeline import ChatPipelineDeps, PipelineError, run_chat_pipeline
 from app.guards.input_guard import InputGuard
@@ -52,7 +51,7 @@ def create_app() -> FastAPI:
     input_guard = InputGuard(policy_engine=policy_engine, llm_client=classifier_client)
     output_guard = OutputGuard(policy_engine=policy_engine, llm_client=classifier_client)
 
-    decision_agent = DecisionAgent(tools=DecisionTools(policy_engine=policy_engine))
+    resolver_agent = ResolverAgent()
     llm_proxy = OpenAIProxyClient.from_env()
 
     hitl_service = None
@@ -62,7 +61,7 @@ def create_app() -> FastAPI:
     deps = ChatPipelineDeps(
         policy_engine=policy_engine,
         input_guard=input_guard,
-        decision_agent=decision_agent,
+        resolver_agent=resolver_agent,
         llm_proxy=llm_proxy,
         output_guard=output_guard,
         hitl_service=hitl_service,

@@ -5,7 +5,7 @@ from typing import Any, Protocol
 
 import anyio
 
-from app.agent.agent import DecisionAgent
+from app.agent.agent import ResolverAgent
 from app.guards.input_guard import InputGuard
 from app.guards.input_guard import InputGuardError
 from app.guards.output_guard import OutputGuard
@@ -40,7 +40,7 @@ class HitlServiceLike(Protocol):
 class ChatPipelineDeps:
     policy_engine: PolicyEngine
     input_guard: InputGuard
-    decision_agent: DecisionAgent
+    resolver_agent: ResolverAgent
     llm_proxy: OpenAIProxyClient
     output_guard: OutputGuard
     hitl_service: HitlServiceLike | None
@@ -84,39 +84,39 @@ async def run_chat_pipeline(
     trace.event(
         "chat.policy.evaluated",
         request_id=request_id,
-        policy_decision=policy_result.decision,
         policy_risk_score=policy_result.risk_score,
+        policy_thresholds=dict(policy_result.thresholds),
         matched_rule_ids=list(policy_result.matched_rule_ids),
     )
 
     try:
-        guard_result = await anyio.to_thread.run_sync(lambda: deps.input_guard.evaluate(message))
+        guard_result = await anyio.to_thread.run_sync(
+            lambda: deps.input_guard.evaluate(message, policy_result=policy_result)
+        )
     except InputGuardError as exc:
         raise PipelineError(str(exc)) from exc
     except Exception as exc:
         raise PipelineError(f"Input guard failed: {exc}") from exc
-    guard_risk_score = float(guard_result.classification.risk_score)
-    masked_input_sanitized = mask_terms_case_insensitive(guard_result.final_text, redact_terms_input)
+    guard_risk_score = float(guard_result.risk_score)
+    sanitized_suggestion = guard_result.sanitized_text or ""
+    masked_input_sanitized = mask_terms_case_insensitive(sanitized_suggestion, redact_terms_input)
     trace.event(
         "chat.input_guard.done",
         request_id=request_id,
-        guard_decision=guard_result.decision,
-        is_malicious=bool(guard_result.classification.is_malicious),
-        guard_attack_type=guard_result.classification.attack_type.value,
+        guard_attack_type=guard_result.attack_type.value,
         guard_risk_score=guard_risk_score,
         input_sanitized=masked_input_sanitized,
-        matched_rule_ids=list(guard_result.matched_rule_ids),
     )
 
     try:
         agent_out = await anyio.to_thread.run_sync(
-            lambda: deps.decision_agent.decide(
-                guard_result=guard_result,
+            lambda: deps.resolver_agent.decide(
+                input_guard_result=guard_result,
                 policy_result=policy_result,
             )
         )
     except Exception as exc:
-        raise PipelineError(f"Decision agent failed: {exc}") from exc
+        raise PipelineError(f"Resolver agent failed: {exc}") from exc
     trace.event(
         "chat.agent.decided",
         request_id=request_id,
@@ -152,7 +152,7 @@ async def run_chat_pipeline(
             request_id=request_id,
             decision="escalate",
             input_raw=message,
-            input_sanitized=guard_result.final_text,
+            input_sanitized=(guard_result.sanitized_text or message),
             risk_score=guard_risk_score,
             guard_obj=guard_obj,
             policy_obj=policy_obj,
@@ -172,8 +172,15 @@ async def run_chat_pipeline(
         return ChatPipelineResult(decision="escalate", output_text="", queue_id=queue_id)
 
     # allow/sanitize path -> LLM proxy
+    if effective_decision == "sanitize":
+        if not guard_result.sanitized_text or not guard_result.sanitized_text.strip():
+            raise PipelineError("Resolver decided sanitize, but sanitized_text is missing")
+        sanitized_text_for_llm = guard_result.sanitized_text
+    else:
+        sanitized_text_for_llm = message
+
     llm_req = LlmProxyRequest(
-        sanitized_text=guard_result.final_text,
+        sanitized_text=sanitized_text_for_llm,
         max_output_tokens=max_output_tokens,
         system_prompt=None,
     )
@@ -185,12 +192,17 @@ async def run_chat_pipeline(
     except Exception as exc:
         raise PipelineError(f"LLM proxy failed: {exc}") from exc
 
-    # Mask logged outputs using policy sensitive-topic matches on the output itself.
-    llm_policy_for_log = await anyio.to_thread.run_sync(lambda: deps.policy_engine.evaluate(llm_resp.raw_text))
-    redact_terms_output = [m.matched for m in llm_policy_for_log.matches if m.policy_type == "sensitive_topic"]
-    redact_terms_output = list(dict.fromkeys(redact_terms_input + redact_terms_output))
-    masked_llm_output = mask_terms_case_insensitive(llm_resp.raw_text, redact_terms_output)
+    try:
+        out_guard = await anyio.to_thread.run_sync(lambda: deps.output_guard.evaluate(llm_resp.raw_text))
+    except OutputGuardError as exc:
+        raise PipelineError(str(exc)) from exc
+    except Exception as exc:
+        raise PipelineError(f"Output guard failed: {exc}") from exc
 
+    # Log raw output after OutputGuard evaluation so we can deterministically redact
+    # without re-evaluating policy in the pipeline.
+    redact_terms_output = list(dict.fromkeys(redact_terms_input + list(getattr(out_guard, "redact_terms", []))))
+    masked_llm_output = mask_terms_case_insensitive(llm_resp.raw_text, redact_terms_output)
     trace.event(
         "chat.llm.generated",
         request_id=request_id,
@@ -199,12 +211,6 @@ async def run_chat_pipeline(
         usage=llm_resp.usage,
     )
 
-    try:
-        out_guard = await anyio.to_thread.run_sync(lambda: deps.output_guard.evaluate(llm_resp.raw_text))
-    except OutputGuardError as exc:
-        raise PipelineError(str(exc)) from exc
-    except Exception as exc:
-        raise PipelineError(f"Output guard failed: {exc}") from exc
     masked_final_output = mask_terms_case_insensitive(out_guard.final_output, redact_terms_output)
     trace.event(
         "chat.output_guard.done",

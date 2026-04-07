@@ -1,4 +1,4 @@
-from .agent import DecisionAgent
+from .agent import ResolverAgent
 from .tools import DecisionTools
 
-__all__ = ["DecisionAgent", "DecisionTools"]
+__all__ = ["ResolverAgent", "DecisionTools"]

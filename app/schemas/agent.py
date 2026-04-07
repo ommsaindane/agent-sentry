@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 Decision = Literal["allow", "block", "sanitize", "escalate"]
 
 
-class DecisionAgentOutput(BaseModel):
+class ResolverAgentOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision: Decision
