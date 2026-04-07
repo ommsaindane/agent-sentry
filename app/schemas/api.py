@@ -28,3 +28,18 @@ class ChatPendingResponse(BaseModel):
     request_id: str
     status: Literal["pending_review"]
     queue_id: int
+
+
+class HitlResolveRequest(BaseModel):
+    queue_id: int = Field(gt=0)
+    action: Literal["approve", "decline"]
+    note: str | None = Field(default=None, max_length=2000)
+    # Required for approve (explicit to avoid hidden defaults)
+    max_output_tokens: int | None = Field(default=None, gt=0, le=8192)
+
+
+class HitlResolveResponse(BaseModel):
+    queue_id: int
+    request_id: str
+    status: Literal["approved", "declined"]
+    output_text: str | None = None

@@ -68,6 +68,9 @@ class Settings:
     sqlite_path: str
     sqlite_table: str
 
+    # HITL reviewer API auth
+    hitl_review_api_key: str
+
     @classmethod
     def from_env(cls) -> "Settings":
         # Fail fast: these are non-negotiable per project rules.
@@ -83,10 +86,14 @@ class Settings:
             risk_threshold = _get_env_float("RISK_THRESHOLD")
             if risk_threshold < 0.0 or risk_threshold > 1.0:
                 raise SettingsError("RISK_THRESHOLD must be in [0,1]")
+
+            # HITL reviewer endpoint must be authenticated.
+            hitl_review_api_key = _require_env("HITL_REVIEW_API_KEY")
         else:
             sqlite_path = os.getenv("HITL_SQLITE_PATH") or ""
             # Risk threshold unused when HITL disabled; keep deterministic value.
             risk_threshold = _get_env_float("RISK_THRESHOLD", default=1.0)
+            hitl_review_api_key = os.getenv("HITL_REVIEW_API_KEY") or ""
 
         sqlite_table = os.getenv("HITL_SQLITE_TABLE")
         if sqlite_table is None or not str(sqlite_table).strip():
@@ -99,6 +106,7 @@ class Settings:
             risk_threshold=float(risk_threshold),
             sqlite_path=str(sqlite_path),
             sqlite_table=str(sqlite_table),
+            hitl_review_api_key=str(hitl_review_api_key),
         )
 
 
