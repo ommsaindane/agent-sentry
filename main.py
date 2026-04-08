@@ -18,13 +18,20 @@ from app.llm.client import OpenAIClient
 from app.llm.llm_client import OpenAIProxyClient
 from app.logging.logger import TraceLogger, get_trace_logger
 from app.policy.policy_engine import PolicyEngine
+from app.request_log.service import RequestLogService
 from app.schemas.api import (
     ChatBlockedResponse,
     ChatOkResponse,
     ChatPendingResponse,
     ChatRequest,
+    HitlQueueDetailResponse,
+    HitlQueueListItem,
+    HitlQueueListResponse,
     HitlResolveRequest,
     HitlResolveResponse,
+    RequestLogDetailResponse,
+    RequestLogListItem,
+    RequestLogListResponse,
 )
 from app.schemas.llm import LlmProxyRequest
 
@@ -70,8 +77,10 @@ def create_app(
         llm_proxy = OpenAIProxyClient.from_env()
 
         hitl_service = None
+        request_log_service = None
         if settings.enable_hitl:
             hitl_service = HitlService.from_settings(settings)
+            request_log_service = RequestLogService.from_settings(settings)
 
         deps = ChatPipelineDeps(
             policy_engine=policy_engine,
@@ -80,6 +89,7 @@ def create_app(
             llm_proxy=llm_proxy,
             output_guard=output_guard,
             hitl_service=hitl_service,
+            request_log_service=request_log_service,
             enable_hitl=settings.enable_hitl,
             risk_threshold=settings.risk_threshold,
         )
@@ -87,11 +97,23 @@ def create_app(
     app = FastAPI(title="AgentSentry", version="0.1.0")
     app.state.state = AppState(deps=deps, trace=trace, settings=settings)
 
+    def _require_review_key(*, review_key: str | None) -> None:
+        state: AppState = app.state.state
+        if not state.settings.enable_hitl:
+            raise HTTPException(status_code=400, detail="HITL is disabled")
+        expected = state.settings.hitl_review_api_key
+        if not expected or not expected.strip():
+            raise HTTPException(status_code=500, detail="HITL review API key not configured")
+        if not review_key or review_key != expected:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     @app.on_event("startup")
     async def _startup() -> None:
         state: AppState = app.state.state
         if state.deps.enable_hitl and state.deps.hitl_service is not None:
             await state.deps.hitl_service.ensure_schema()
+        if state.deps.enable_hitl and state.deps.request_log_service is not None:
+            await state.deps.request_log_service.ensure_schema()
 
     @app.post(
         "/chat",
@@ -162,14 +184,7 @@ def create_app(
     ):
         state: AppState = app.state.state
 
-        if not state.settings.enable_hitl:
-            raise HTTPException(status_code=400, detail="HITL is disabled")
-
-        expected = state.settings.hitl_review_api_key
-        if not expected or not expected.strip():
-            raise HTTPException(status_code=500, detail="HITL review API key not configured")
-        if not review_key or review_key != expected:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+        _require_review_key(review_key=review_key)
 
         hitl_service = state.deps.hitl_service
         if hitl_service is None or not hasattr(hitl_service, "get_item") or not hasattr(hitl_service, "mark_reviewed"):
@@ -199,6 +214,20 @@ def create_app(
             except Exception as exc:
                 state.trace.event("hitl.resolve.error", queue_id=int(req.queue_id), error=str(exc))
                 raise HTTPException(status_code=500, detail="Failed to update HITL queue item") from exc
+
+            if state.deps.request_log_service is not None:
+                try:
+                    await state.deps.request_log_service.update_status_by_request_id(
+                        request_id=str(item.request_id),
+                        status="declined",
+                    )
+                except Exception as exc:
+                    state.trace.event(
+                        "hitl.resolve.error",
+                        queue_id=int(req.queue_id),
+                        error=f"request_log_update_failed: {exc}",
+                    )
+                    raise HTTPException(status_code=500, detail="Failed to update request log") from exc
 
             state.trace.event(
                 "hitl.resolve.declined",
@@ -254,6 +283,20 @@ def create_app(
                 state.trace.event("hitl.resolve.error", queue_id=int(req.queue_id), error=str(exc))
                 raise HTTPException(status_code=500, detail="Failed to update HITL queue item") from exc
 
+            if state.deps.request_log_service is not None:
+                try:
+                    await state.deps.request_log_service.update_status_by_request_id(
+                        request_id=str(item.request_id),
+                        status="declined",
+                    )
+                except Exception as exc:
+                    state.trace.event(
+                        "hitl.resolve.error",
+                        queue_id=int(req.queue_id),
+                        error=f"request_log_update_failed: {exc}",
+                    )
+                    raise HTTPException(status_code=500, detail="Failed to update request log") from exc
+
             state.trace.event(
                 "hitl.resolve.approve_blocked",
                 queue_id=int(req.queue_id),
@@ -277,6 +320,20 @@ def create_app(
             state.trace.event("hitl.resolve.error", queue_id=int(req.queue_id), error=str(exc))
             raise HTTPException(status_code=500, detail="Failed to update HITL queue item") from exc
 
+        if state.deps.request_log_service is not None:
+            try:
+                await state.deps.request_log_service.update_status_by_request_id(
+                    request_id=str(item.request_id),
+                    status="approved",
+                )
+            except Exception as exc:
+                state.trace.event(
+                    "hitl.resolve.error",
+                    queue_id=int(req.queue_id),
+                    error=f"request_log_update_failed: {exc}",
+                )
+                raise HTTPException(status_code=500, detail="Failed to update request log") from exc
+
         state.trace.event(
             "hitl.resolve.approved",
             queue_id=int(req.queue_id),
@@ -287,6 +344,172 @@ def create_app(
             request_id=str(item.request_id),
             status="approved",
             output_text=final_output,
+        ).model_dump()
+        return JSONResponse(status_code=200, content=body)
+
+    @app.get(
+        "/requests",
+        responses={200: {"model": RequestLogListResponse}, 401: {"description": "Unauthorized"}},
+    )
+    async def requests_list(
+        limit: int = 100,
+        offset: int = 0,
+        decision: str | None = None,
+        status: str | None = None,
+        review_key: str | None = Header(default=None, alias="X-HITL-REVIEW-KEY"),
+    ):
+        state: AppState = app.state.state
+        _require_review_key(review_key=review_key)
+
+        svc = state.deps.request_log_service
+        if svc is None:
+            raise HTTPException(status_code=400, detail="Request logging is not configured")
+
+        try:
+            rows = await svc.list_requests(limit=int(limit), offset=int(offset), decision=decision, status=status)
+        except Exception as exc:
+            state.trace.event("requests.list.error", error=str(exc))
+            raise HTTPException(status_code=500, detail="Failed to list requests") from exc
+
+        items = [
+            RequestLogListItem(
+                request_id=str(r.request_id),
+                created_at=str(r.created_at),
+                decision=str(r.decision),
+                status=str(r.status),
+                risk_score=float(r.risk_score),
+                policy_risk_score=float(r.policy_risk_score),
+                queue_id=(int(r.queue_id) if r.queue_id is not None else None),
+            )
+            for r in rows
+        ]
+        return JSONResponse(status_code=200, content=RequestLogListResponse(items=items).model_dump())
+
+    @app.get(
+        "/requests/{request_id}",
+        responses={
+            200: {"model": RequestLogDetailResponse},
+            401: {"description": "Unauthorized"},
+            404: {"description": "Not Found"},
+        },
+    )
+    async def requests_get(
+        request_id: str,
+        review_key: str | None = Header(default=None, alias="X-HITL-REVIEW-KEY"),
+    ):
+        state: AppState = app.state.state
+        _require_review_key(review_key=review_key)
+
+        svc = state.deps.request_log_service
+        if svc is None:
+            raise HTTPException(status_code=400, detail="Request logging is not configured")
+
+        try:
+            row = await svc.get_request(request_id=str(request_id))
+        except Exception as exc:
+            state.trace.event("requests.get.error", request_id=str(request_id), error=str(exc))
+            raise HTTPException(status_code=500, detail="Failed to load request") from exc
+
+        if row is None:
+            raise HTTPException(status_code=404, detail="Request not found")
+
+        body = RequestLogDetailResponse(
+            request_id=str(row.request_id),
+            created_at=str(row.created_at),
+            decision=str(row.decision),
+            status=str(row.status),
+            risk_score=float(row.risk_score),
+            policy_risk_score=float(row.policy_risk_score),
+            queue_id=(int(row.queue_id) if row.queue_id is not None else None),
+            input_raw=str(row.input_raw),
+            input_sanitized=str(row.input_sanitized),
+            output_text=(str(row.output_text) if row.output_text is not None else None),
+            guard_obj=dict(row.guard_obj),
+            policy_obj=dict(row.policy_obj),
+            agent_obj=dict(row.agent_obj),
+            output_obj=(dict(row.output_obj) if row.output_obj is not None else None),
+        ).model_dump()
+        return JSONResponse(status_code=200, content=body)
+
+    @app.get(
+        "/hitl/queue",
+        responses={200: {"model": HitlQueueListResponse}, 401: {"description": "Unauthorized"}},
+    )
+    async def hitl_queue_list(
+        status: str | None = "pending_review",
+        limit: int = 100,
+        offset: int = 0,
+        review_key: str | None = Header(default=None, alias="X-HITL-REVIEW-KEY"),
+    ):
+        state: AppState = app.state.state
+        _require_review_key(review_key=review_key)
+
+        svc = state.deps.hitl_service
+        if svc is None or not hasattr(svc, "list_items"):
+            raise HTTPException(status_code=500, detail="HITL service is not configured")
+
+        try:
+            rows = await svc.list_items(status=status, limit=int(limit), offset=int(offset))  # type: ignore[attr-defined]
+        except Exception as exc:
+            state.trace.event("hitl.queue.list.error", error=str(exc))
+            raise HTTPException(status_code=500, detail="Failed to list HITL queue") from exc
+
+        items = [
+            HitlQueueListItem(
+                queue_id=int(r.queue_id),
+                request_id=str(r.request_id),
+                created_at=str(r.created_at),
+                risk_score=float(r.risk_score),
+                decision=str(r.decision),
+                status=str(r.status),
+            )
+            for r in rows
+        ]
+
+        return JSONResponse(status_code=200, content=HitlQueueListResponse(items=items).model_dump())
+
+    @app.get(
+        "/hitl/queue/{queue_id}",
+        responses={
+            200: {"model": HitlQueueDetailResponse},
+            401: {"description": "Unauthorized"},
+            404: {"description": "Not Found"},
+        },
+    )
+    async def hitl_queue_get(
+        queue_id: int,
+        review_key: str | None = Header(default=None, alias="X-HITL-REVIEW-KEY"),
+    ):
+        state: AppState = app.state.state
+        _require_review_key(review_key=review_key)
+
+        svc = state.deps.hitl_service
+        if svc is None or not hasattr(svc, "get_item"):
+            raise HTTPException(status_code=500, detail="HITL service is not configured")
+
+        try:
+            item = await svc.get_item(queue_id=int(queue_id))  # type: ignore[attr-defined]
+        except Exception as exc:
+            state.trace.event("hitl.queue.get.error", queue_id=int(queue_id), error=str(exc))
+            raise HTTPException(status_code=500, detail="Failed to load HITL queue item") from exc
+
+        if item is None:
+            raise HTTPException(status_code=404, detail="Queue item not found")
+
+        body = HitlQueueDetailResponse(
+            queue_id=int(item.queue_id),
+            request_id=str(item.request_id),
+            created_at=str(item.created_at),
+            risk_score=float(item.risk_score),
+            decision=str(item.decision),
+            status=str(item.status),
+            input_raw=str(item.input_raw),
+            input_sanitized=str(item.input_sanitized),
+            guard_obj=dict(item.guard_obj),
+            policy_obj=dict(item.policy_obj),
+            agent_obj=dict(item.agent_obj),
+            review_note=(str(item.review_note) if item.review_note is not None else None),
+            reviewed_at=(str(item.reviewed_at) if item.reviewed_at is not None else None),
         ).model_dump()
         return JSONResponse(status_code=200, content=body)
 

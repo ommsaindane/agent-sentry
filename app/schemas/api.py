@@ -43,3 +43,65 @@ class HitlResolveResponse(BaseModel):
     request_id: str
     status: Literal["approved", "declined"]
     output_text: str | None = None
+
+
+class RequestLogListItem(BaseModel):
+    request_id: str
+    created_at: str
+    decision: Literal["allow", "sanitize", "block", "escalate"]
+    status: str
+    risk_score: float
+    policy_risk_score: float
+    queue_id: int | None = None
+
+
+class RequestLogListResponse(BaseModel):
+    items: list[RequestLogListItem]
+
+
+class RequestLogDetailResponse(BaseModel):
+    request_id: str
+    created_at: str
+    decision: Literal["allow", "sanitize", "block", "escalate"]
+    status: str
+    risk_score: float
+    policy_risk_score: float
+    queue_id: int | None = None
+
+    input_raw: str
+    input_sanitized: str
+    output_text: str | None = None
+
+    guard_obj: dict[str, Any]
+    policy_obj: dict[str, Any]
+    agent_obj: dict[str, Any]
+    output_obj: dict[str, Any] | None = None
+
+
+class HitlQueueListItem(BaseModel):
+    queue_id: int
+    request_id: str
+    created_at: str
+    risk_score: float
+    decision: str
+    status: str
+
+
+class HitlQueueListResponse(BaseModel):
+    items: list[HitlQueueListItem]
+
+
+class HitlQueueDetailResponse(BaseModel):
+    queue_id: int
+    request_id: str
+    created_at: str
+    risk_score: float
+    decision: str
+    status: str
+    input_raw: str
+    input_sanitized: str
+    guard_obj: dict[str, Any]
+    policy_obj: dict[str, Any]
+    agent_obj: dict[str, Any]
+    review_note: str | None = None
+    reviewed_at: str | None = None

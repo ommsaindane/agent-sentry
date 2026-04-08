@@ -71,6 +71,9 @@ class Settings:
     # HITL reviewer API auth
     hitl_review_api_key: str
 
+    # Request log table (used by Streamlit UI)
+    request_log_table: str
+
     @classmethod
     def from_env(cls) -> "Settings":
         # Fail fast: these are non-negotiable per project rules.
@@ -99,6 +102,10 @@ class Settings:
         if sqlite_table is None or not str(sqlite_table).strip():
             sqlite_table = "hitl_queue"
 
+        request_log_table = os.getenv("REQUEST_LOG_SQLITE_TABLE")
+        if request_log_table is None or not str(request_log_table).strip():
+            request_log_table = "request_log"
+
         return cls(
             openai_api_key=openai_api_key,
             openai_model=openai_model,
@@ -107,6 +114,7 @@ class Settings:
             sqlite_path=str(sqlite_path),
             sqlite_table=str(sqlite_table),
             hitl_review_api_key=str(hitl_review_api_key),
+            request_log_table=str(request_log_table),
         )
 
 

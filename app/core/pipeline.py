@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from datetime import datetime, timezone
+
 import anyio
 
 from app.agent.agent import ResolverAgent
@@ -36,6 +38,42 @@ class HitlServiceLike(Protocol):
     ) -> Any: ...
 
 
+class RequestLogServiceLike(Protocol):
+    async def ensure_schema(self) -> None: ...
+
+    async def record(
+        self,
+        *,
+        request_id: str,
+        decision: str,
+        status: str,
+        created_at: str,
+        risk_score: float,
+        policy_risk_score: float,
+        queue_id: int | None,
+        input_raw: str,
+        input_sanitized: str,
+        output_text: str | None,
+        guard_obj: dict[str, Any],
+        policy_obj: dict[str, Any],
+        agent_obj: dict[str, Any],
+        output_obj: dict[str, Any] | None,
+    ) -> None: ...
+
+    async def update_status_by_request_id(self, *, request_id: str, status: str) -> None: ...
+
+    async def list_requests(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        decision: str | None = None,
+        status: str | None = None,
+    ) -> list[Any]: ...
+
+    async def get_request(self, *, request_id: str) -> Any: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ChatPipelineDeps:
     policy_engine: PolicyEngine
@@ -44,6 +82,7 @@ class ChatPipelineDeps:
     llm_proxy: OpenAIProxyClient
     output_guard: OutputGuard
     hitl_service: HitlServiceLike | None
+    request_log_service: RequestLogServiceLike | None
     enable_hitl: bool
     risk_threshold: float
 
@@ -69,6 +108,8 @@ async def run_chat_pipeline(
         raise PipelineError("message must be a non-empty string")
     if not isinstance(max_output_tokens, int) or max_output_tokens <= 0:
         raise PipelineError("max_output_tokens must be a positive integer")
+
+    created_at = datetime.now(timezone.utc).isoformat()
 
     policy_result = await anyio.to_thread.run_sync(lambda: deps.policy_engine.evaluate(message))
 
@@ -138,6 +179,28 @@ async def run_chat_pipeline(
 
     if effective_decision == "block":
         trace.event("chat.terminated.blocked", request_id=request_id)
+
+        if deps.request_log_service is not None:
+            try:
+                await deps.request_log_service.record(
+                    request_id=request_id,
+                    decision="block",
+                    status="completed",
+                    created_at=created_at,
+                    risk_score=float(guard_risk_score),
+                    policy_risk_score=float(policy_result.risk_score),
+                    queue_id=None,
+                    input_raw=message,
+                    input_sanitized=(guard_result.sanitized_text or ""),
+                    output_text=None,
+                    guard_obj=guard_result.model_dump(),
+                    policy_obj=policy_result.to_dict(),
+                    agent_obj=agent_out.model_dump(),
+                    output_obj=None,
+                )
+            except Exception as exc:
+                raise PipelineError(f"Request log failed: {exc}") from exc
+
         return ChatPipelineResult(decision="block", output_text="", queue_id=None)
 
     if effective_decision == "escalate":
@@ -168,6 +231,27 @@ async def run_chat_pipeline(
             request_id=request_id,
             queue_id=queue_id,
         )
+
+        if deps.request_log_service is not None:
+            try:
+                await deps.request_log_service.record(
+                    request_id=request_id,
+                    decision="escalate",
+                    status="pending_review",
+                    created_at=created_at,
+                    risk_score=float(guard_risk_score),
+                    policy_risk_score=float(policy_result.risk_score),
+                    queue_id=int(queue_id),
+                    input_raw=message,
+                    input_sanitized=(guard_result.sanitized_text or message),
+                    output_text=None,
+                    guard_obj=guard_obj,
+                    policy_obj=policy_obj,
+                    agent_obj=agent_obj,
+                    output_obj=None,
+                )
+            except Exception as exc:
+                raise PipelineError(f"Request log failed: {exc}") from exc
 
         return ChatPipelineResult(decision="escalate", output_text="", queue_id=queue_id)
 
@@ -225,7 +309,62 @@ async def run_chat_pipeline(
 
     if not out_guard.is_safe:
         trace.event("chat.terminated.output_blocked", request_id=request_id)
+
+        if deps.request_log_service is not None:
+            try:
+                await deps.request_log_service.record(
+                    request_id=request_id,
+                    decision="block",
+                    status="completed",
+                    created_at=created_at,
+                    risk_score=float(guard_risk_score),
+                    policy_risk_score=float(policy_result.risk_score),
+                    queue_id=None,
+                    input_raw=message,
+                    input_sanitized=(guard_result.sanitized_text or ""),
+                    output_text=str(out_guard.final_output),
+                    guard_obj=guard_result.model_dump(),
+                    policy_obj=policy_result.to_dict(),
+                    agent_obj=agent_out.model_dump(),
+                    output_obj={
+                        "is_safe": bool(out_guard.is_safe),
+                        "violations": list(out_guard.violations),
+                        "output_policy_decision": out_guard.policy_decision,
+                        "output_policy_risk_score": int(out_guard.policy_risk_score),
+                        "matched_rule_ids": list(out_guard.matched_rule_ids),
+                    },
+                )
+            except Exception as exc:
+                raise PipelineError(f"Request log failed: {exc}") from exc
         return ChatPipelineResult(decision="block", output_text=out_guard.final_output, queue_id=None)
 
     trace.event("chat.completed", request_id=request_id)
+
+    if deps.request_log_service is not None:
+        try:
+            await deps.request_log_service.record(
+                request_id=request_id,
+                decision=str(effective_decision),
+                status="completed",
+                created_at=created_at,
+                risk_score=float(guard_risk_score),
+                policy_risk_score=float(policy_result.risk_score),
+                queue_id=None,
+                input_raw=message,
+                input_sanitized=(guard_result.sanitized_text or ""),
+                output_text=str(out_guard.final_output),
+                guard_obj=guard_result.model_dump(),
+                policy_obj=policy_result.to_dict(),
+                agent_obj=agent_out.model_dump(),
+                output_obj={
+                    "is_safe": bool(out_guard.is_safe),
+                    "violations": list(out_guard.violations),
+                    "output_policy_decision": out_guard.policy_decision,
+                    "output_policy_risk_score": int(out_guard.policy_risk_score),
+                    "matched_rule_ids": list(out_guard.matched_rule_ids),
+                },
+            )
+        except Exception as exc:
+            raise PipelineError(f"Request log failed: {exc}") from exc
+
     return ChatPipelineResult(decision=str(effective_decision), output_text=out_guard.final_output, queue_id=None)

@@ -39,8 +39,34 @@
       "match": {
         "phrases": [
           "you are now the system",
+          "you are now a system",
           "act as the system",
+          "act as a system",
+          "pretend to be the system",
+          "pretend you are the system",
+          "you are the system now",
           "system prompt"
+        ]
+      }
+    },
+
+    "INJ_BLOCK_HIDDEN_DATA_EXFIL": {
+      "id": "INJ_BLOCK_HIDDEN_DATA_EXFIL",
+      "policy_type": "restricted_action",
+      "enabled": true,
+      "description": "Blocks attempts to reveal hidden/system data or secrets.",
+      "action": "block",
+      "score": 100,
+      "match": {
+        "phrases": [
+          "show hidden data",
+          "reveal hidden data",
+          "reveal secrets",
+          "show secrets",
+          "reveal the system prompt",
+          "show the system prompt",
+          "reveal developer message",
+          "show developer message"
         ]
       }
     },

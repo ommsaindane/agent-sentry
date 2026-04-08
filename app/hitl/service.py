@@ -36,6 +36,16 @@ class HitlQueueItem:
 
 
 @dataclass(frozen=True, slots=True)
+class HitlQueueListItem:
+    queue_id: int
+    request_id: str
+    created_at: str
+    risk_score: float
+    decision: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
 class HitlService:
     settings: Settings
     connector: SqliteConnector
@@ -220,6 +230,64 @@ CREATE TABLE IF NOT EXISTS {table} (
             raise
         except Exception as exc:
             raise HitlServiceError(f"Failed to parse HITL queue item: {exc}") from exc
+
+    async def list_items(
+        self,
+        *,
+        status: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[HitlQueueListItem]:
+        if not isinstance(limit, int) or limit <= 0 or limit > 500:
+            raise HitlServiceError("limit must be an integer in [1,500]")
+        if not isinstance(offset, int) or offset < 0:
+            raise HitlServiceError("offset must be a non-negative integer")
+
+        table = self.settings.sqlite_table
+
+        where_sql = ""
+        args: list[Any] = []
+        if isinstance(status, str) and status.strip():
+            where_sql = " WHERE status = ?"
+            args.append(str(status))
+
+        sql = (
+            f"SELECT id, request_id, created_at, risk_score, decision, status "
+            f"FROM {table}{where_sql} "
+            "ORDER BY created_at DESC "
+            "LIMIT ? OFFSET ?"
+        )
+        args.extend([int(limit), int(offset)])
+
+        try:
+            conn = await self.connector.connect()
+            try:
+                cur = await conn.execute(sql, tuple(args))
+                rows = await cur.fetchall()
+            finally:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+        except HitlDbError as exc:
+            raise HitlServiceError(str(exc)) from exc
+        except Exception as exc:
+            raise HitlServiceError(f"Failed to list HITL queue items: {exc}") from exc
+
+        out: list[HitlQueueListItem] = []
+        for row in rows or []:
+            rid, request_id, created_at, risk_score, decision, status_v = row
+            out.append(
+                HitlQueueListItem(
+                    queue_id=int(rid),
+                    request_id=str(request_id),
+                    created_at=str(created_at),
+                    risk_score=float(risk_score),
+                    decision=str(decision),
+                    status=str(status_v),
+                )
+            )
+        return out
 
     async def mark_reviewed(
         self,
